@@ -1,0 +1,499 @@
+//+------------------------------------------------------------------+
+//|      Project Prometheus v3.1 - The Fire Thief (Fused)          |
+//|   Fuses the stability of Ultimate Gold EA with the intelligence  |
+//|   of Lion's Fury AI for a superior, stabilized trading system.   |
+//+------------------------------------------------------------------+
+#property copyright "Synthesized by AI"
+#property link      "https://www.google.com"
+#property version   "3.1"
+#property strict
+
+#include <Trade\Trade.mqh>
+#include <Trade\AccountInfo.mqh>
+#include <Trade\PositionInfo.mqh>
+
+//--- Global Objects
+CTrade        trade;
+CAccountInfo  account;
+CPositionInfo position;
+
+//--- CORE SETTINGS
+input group "=== CORE SETTINGS ==="
+input ulong           InpMagicNumber        = 202408;     // EA Magic Number
+input ENUM_TIMEFRAMES InpTimeframe          = PERIOD_M15;   // Trading Timeframe
+input int             InpMaxOpenTrades      = 10;         // Maximum open trades
+input double          InpMaxSpreadPoints    = 40.0;       // Maximum allowed spread in points
+
+//--- SIGNAL ENGINE (TRIPLE CONFIRMATION)
+input group "=== SIGNAL ENGINE (TRIPLE CONFIRMATION) ==="
+input int    InpFastMA_Period     = 8;        // Fast EMA Period for Crossover
+input int    InpSlowMA_Period     = 21;       // Slow EMA Period for Crossover
+input int    InpTrendMA_Period    = 55;       // Trend EMA Period (from H1)
+input int    InpRSIPeriod         = 14;       // RSI Period for Momentum
+input double InpRSI_Momentum_Level= 52.0;      // RSI level to confirm momentum (e.g., 52 for buy)
+input int    InpATR_Period        = 14;       // ATR Period for SL/TP
+input double InpATR_SL_Multiplier = 1.5;      // ATR Multiplier for Stop Loss
+input double InpATR_TP_Multiplier = 2.5;      // ATR Multiplier for Take Profit
+
+//--- RISK & MONEY MANAGEMENT
+input group "=== RISK & MONEY MANAGEMENT ==="
+input double InpRiskPercent         = 1.5;      // Risk per trade in percentage
+input bool   InpUseMartingale       = true;     // Enable Martingale after a loss
+input double InpMartingaleMultiplier= 1.8;      // Lot size multiplier after a loss
+input bool   InpUseWinMultiplier    = true;     // Enable lot multiplier after a win
+input double InpWinMultiplier       = 1.5;      // Lot size multiplier after a win
+input double InpSuccessThreshold    = 65.0;     // Win rate percentage to trigger win multiplier
+
+//--- DYNAMIC RISK ADAPTATION (AI-INSPIRED)
+input group "=== DYNAMIC RISK ADAPTATION (AI-INSPIRED) ==="
+input bool   InpEnableDynamicRisk   = true;     // Enable automatic risk reduction on losses
+input int    InpLossStreakToReduceRisk = 3;     // Consecutive losses to trigger caution mode
+input double InpRiskReductionFactor = 0.5;      // Factor to reduce risk by (e.g., 0.5 = 50% risk)
+
+//--- TRADE MANAGEMENT
+input group "=== TRADE MANAGEMENT ==="
+input bool   InpEnableTrailingStop  = true;     // Enable Trailing Stop
+input int    InpTrailingStartPoints = 400;      // Points to start trailing
+input int    InpTrailingStopPoints  = 200;      // Trailing step in points
+input bool   InpEnableBreakEven     = true;     // Enable Break-Even
+input int    InpBreakEvenPoints     = 200;      // Points to trigger break-even
+input bool   InpEnablePartialClose  = true;     // Enable Partial Close
+input int    InpPartialProfitPoints = 300;      // Points to trigger partial close
+
+//--- CAPITAL PROTECTION
+input group "=== CAPITAL PROTECTION ==="
+input bool   InpEnableEquityLock    = true;     // Enable Equity Lock
+input double InpEquityLockPercent   = 80.0;     // Percentage of profit to lock
+
+//--- TIME FILTER
+input group "=== TIME FILTER ==="
+input bool   InpEnableTimeFilter    = true;     // Enable Time Filter
+input int    InpTradeHourStart      = 8;        // Trading start hour
+input int    InpTradeHourEnd        = 22;       // Trading end hour
+
+//--- Global Variables
+int hFastMA, hSlowMA, hTrendMA, hRSI, hATR;
+double lastTradeResult = 0.0; // Profit/Loss of the last trade
+int winCount = 0, lossCount = 0, consecutiveLosses = 0; // Added consecutive loss counter
+double peakEquity = 0.0;
+bool tradingSuspended = false;
+datetime lastDay = 0;
+double totalProfitToday = 0.0;
+bool protectionActivated = false;
+double deposit = 0.0;
+static datetime lastBarTime = 0; // Variable to track the last bar time
+
+
+//+------------------------------------------------------------------+
+//| Close all open positions for this EA                             |
+//+------------------------------------------------------------------+
+void CloseAllPositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+      {
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Get start of current day                                         |
+//+------------------------------------------------------------------+
+datetime DateOfToday()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   dt.hour = dt.min = dt.sec = 0;
+   return(StructToTime(dt));
+}
+
+//+------------------------------------------------------------------+
+//| Reset daily stats and equity lock                              |
+//+------------------------------------------------------------------+
+void DailyReset()
+{
+   datetime today = DateOfToday();
+   if(today != lastDay)
+   {
+      lastDay             = today;
+      winCount            = 0;
+      lossCount           = 0;
+      consecutiveLosses   = 0;
+      totalProfitToday    = 0.0;
+      tradingSuspended    = false;
+      protectionActivated = false;
+      deposit             = account.Balance();
+      peakEquity          = deposit;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update today’s profit, win/loss counts                          |
+//+------------------------------------------------------------------+
+void UpdateTradeStats()
+{
+   static datetime last_check = 0;
+   if(TimeCurrent() - last_check < 60 && last_check != 0) return;
+   last_check = TimeCurrent();
+
+   double sumP = 0;
+   int    w = 0, l = 0;
+   HistorySelect(DateOfToday(), TimeCurrent());
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) == DEAL_ENTRY_IN) continue;
+      
+      double p = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+      sumP += p;
+      if(p > 0) w++; else if(p < 0) l++;
+   }
+   totalProfitToday = sumP;
+   winCount         = w;
+   lossCount        = l;
+}
+
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+    hFastMA  = iMA(_Symbol, InpTimeframe, InpFastMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+    hSlowMA  = iMA(_Symbol, InpTimeframe, InpSlowMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+    hTrendMA = iMA(_Symbol, PERIOD_H1, InpTrendMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+    hRSI     = iRSI(_Symbol, InpTimeframe, InpRSIPeriod, PRICE_CLOSE);
+    hATR     = iATR(_Symbol, InpTimeframe, InpATR_Period);
+
+    if(hFastMA == INVALID_HANDLE || hSlowMA == INVALID_HANDLE || hTrendMA == INVALID_HANDLE ||
+       hRSI == INVALID_HANDLE || hATR == INVALID_HANDLE)
+    {
+        Print("Error initializing indicators!");
+        return(INIT_FAILED);
+    }
+
+    DailyReset();
+    peakEquity = account.Equity();
+    deposit = account.Balance();
+    trade.SetExpertMagicNumber(InpMagicNumber);
+
+    Print("Project Prometheus v3.1 Initialized Successfully.");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+    IndicatorRelease(hFastMA);
+    IndicatorRelease(hSlowMA);
+    IndicatorRelease(hTrendMA);
+    IndicatorRelease(hRSI);
+    IndicatorRelease(hATR);
+    Print("Project Prometheus v3.1 Deinitialized.");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+    MqlRates rates[1];
+    if(CopyRates(_Symbol, InpTimeframe, 0, 1, rates) < 1) return;
+    datetime currentBarTime = rates[0].time;
+
+    if(PositionsTotal() > 0)
+        ManageOpenPositions();
+
+    if(currentBarTime == lastBarTime)
+    {
+        return; 
+    }
+    lastBarTime = currentBarTime;
+
+    DailyReset();
+    UpdateTradeStats();
+    
+    if(tradingSuspended)
+    {
+        Comment("Trading is suspended due to equity lock.");
+        return;
+    }
+
+    if(InpEnableEquityLock)
+        CheckEquityLock();
+
+    if(IsTradingAllowed())
+    {
+        double atrValue;
+        int signal = GetSignal(atrValue);
+
+        if(signal != 0)
+        {
+            OpenTrade(signal, atrValue);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check if trading is allowed                                      |
+//+------------------------------------------------------------------+
+bool IsTradingAllowed()
+{
+    if(PositionsTotal() >= InpMaxOpenTrades)
+        return false;
+
+    if(InpEnableTimeFilter)
+    {
+        MqlDateTime dt;
+        TimeToStruct(TimeCurrent(), dt);
+        if(dt.hour < InpTradeHourStart || dt.hour >= InpTradeHourEnd)
+            return false;
+    }
+
+    if(SymbolInfoInteger(_Symbol, SYMBOL_SPREAD) > InpMaxSpreadPoints)
+        return false;
+
+    return true;
+}
+
+//+------------------------------------------------------------------+
+//| Get trading signal (Triple Confirmation on Completed Bar)        |
+//+------------------------------------------------------------------+
+int GetSignal(double &atrValue)
+{
+    // We need 2 bars of data to look at the most recently completed bar (index 1)
+    double fastMA[2], slowMA[2], trendMA[2], rsi[2], atr[2];
+
+    if(CopyBuffer(hFastMA, 0, 0, 2, fastMA) < 2 || CopyBuffer(hSlowMA, 0, 0, 2, slowMA) < 2 ||
+       CopyBuffer(hTrendMA, 0, 0, 2, trendMA) < 2 || CopyBuffer(hRSI, 0, 0, 2, rsi) < 2 ||
+       CopyBuffer(hATR, 0, 0, 2, atr) < 2)
+    {
+        Print("Failed to copy indicator buffers in GetSignal.");
+        return 0;
+    }
+
+    // --- All signal logic is now based on the last completed bar (index 1) ---
+    // This prevents signals from changing on the current, unfinished bar.
+
+    atrValue = atr[1]; // Use ATR of the completed bar for SL/TP calculation
+    
+    // 1. Trend Filter: Is the price above/below the long-term trend MA?
+    MqlRates rates[2];
+    if(CopyRates(_Symbol, InpTimeframe, 0, 2, rates) < 2) return 0;
+    double lastClose = rates[1].close; // Close price of the completed bar
+
+    bool isUptrend = (lastClose > trendMA[1]);
+    bool isDowntrend = (lastClose < trendMA[1]);
+
+    // 2. State Signal: Is the short-term trend aligned?
+    bool buyState = fastMA[1] > slowMA[1];
+    bool sellState = fastMA[1] < slowMA[1];
+
+    // 3. Momentum Filter: Does RSI confirm the momentum?
+    bool buyMomentum = rsi[1] > InpRSI_Momentum_Level;
+    bool sellMomentum = rsi[1] < (100.0 - InpRSI_Momentum_Level);
+
+    // Combine all conditions for the final signal
+    if(buyState && isUptrend && buyMomentum)
+        return 1; // Buy
+
+    if(sellState && isDowntrend && sellMomentum)
+        return -1; // Sell
+
+    return 0; // No signal
+}
+
+
+//+------------------------------------------------------------------+
+//| Open a new trade                                                 |
+//+------------------------------------------------------------------+
+void OpenTrade(int signal, double atrValue)
+{
+    double lotSize = CalculateLotSize(atrValue);
+    if(lotSize <= 0) return; 
+    
+    double price, sl, tp;
+
+    if(signal == 1) // Buy
+    {
+        price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+        sl = price - atrValue * InpATR_SL_Multiplier;
+        tp = price + atrValue * InpATR_TP_Multiplier;
+        trade.Buy(lotSize, _Symbol, price, sl, tp, "Prometheus Buy");
+    }
+    else if(signal == -1) // Sell
+    {
+        price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+        sl = price + atrValue * InpATR_SL_Multiplier;
+        tp = price - atrValue * InpATR_TP_Multiplier;
+        trade.Sell(lotSize, _Symbol, price, sl, tp, "Prometheus Sell");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Lot Size with Dynamic Risk                             |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double atrValue)
+{
+    double currentRisk = InpRiskPercent;
+    
+    // Dynamic Risk Adaptation
+    if(InpEnableDynamicRisk && consecutiveLosses >= InpLossStreakToReduceRisk)
+    {
+        currentRisk *= InpRiskReductionFactor;
+        Comment("Caution Mode Activated: Risk reduced to " + DoubleToString(currentRisk, 2) + "%");
+    }
+
+    double balance = account.Balance();
+    double riskAmount = balance * (currentRisk / 100.0);
+    double slDistance = atrValue * InpATR_SL_Multiplier;
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    
+    if (tickSize == 0) return 0.01;
+
+    double slValuePerLot = slDistance * (tickValue / tickSize);
+    if(slValuePerLot <= 0) return 0.01;
+    
+    double lot = riskAmount / slValuePerLot;
+
+    double winRate = (winCount + lossCount > 0) ? (double)winCount / (winCount + lossCount) * 100.0 : 0.0;
+
+    if(InpUseWinMultiplier && lastTradeResult > 0 && winRate >= InpSuccessThreshold)
+        lot *= InpWinMultiplier;
+    else if(InpUseMartingale && lastTradeResult < 0)
+        lot *= InpMartingaleMultiplier;
+
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+
+    lot = MathRound(lot / lotStep) * lotStep;
+    return fmax(minLot, fmin(lot, maxLot));
+}
+
+//+------------------------------------------------------------------+
+//| Manage Open Positions                                            |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+    for(int i = PositionsTotal() - 1; i >= 0; i--)
+    {
+        if(position.SelectByIndex(i) && position.Magic() == InpMagicNumber)
+        {
+            double openPrice = position.PriceOpen();
+            double currentPrice = position.PriceCurrent();
+            double sl = position.StopLoss();
+            double tp = position.TakeProfit();
+            ulong ticket = position.Ticket();
+            ENUM_POSITION_TYPE type = position.PositionType();
+
+            double profitPoints = (type == POSITION_TYPE_BUY) ? 
+                                  (currentPrice - openPrice) / _Point :
+                                  (openPrice - currentPrice) / _Point;
+
+            // Partial Close
+            if(InpEnablePartialClose && profitPoints >= InpPartialProfitPoints)
+            {
+                double volume = position.Volume();
+                if(volume / 2 >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+                {
+                    trade.PositionClosePartial(ticket, volume / 2);
+                }
+            }
+
+            // Break-Even
+            if(InpEnableBreakEven && profitPoints >= InpBreakEvenPoints)
+            {
+                if( (type == POSITION_TYPE_BUY && sl < openPrice) || 
+                    (type == POSITION_TYPE_SELL && (sl > openPrice || sl == 0)) )
+                {
+                    trade.PositionModify(ticket, openPrice, tp);
+                }
+            }
+            
+            // Trailing Stop
+            if(InpEnableTrailingStop && profitPoints >= InpTrailingStartPoints)
+            {
+                double newSL = (type == POSITION_TYPE_BUY) ? 
+                               currentPrice - InpTrailingStopPoints * _Point :
+                               currentPrice + InpTrailingStopPoints * _Point;
+
+                if( (type == POSITION_TYPE_BUY && newSL > sl) || 
+                    (type == POSITION_TYPE_SELL && (newSL < sl || sl == 0)) )
+                {
+                    trade.PositionModify(ticket, newSL, tp);
+                }
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Check Equity Lock                                                |
+//+------------------------------------------------------------------+
+void CheckEquityLock()
+{
+    double currentEquity = account.Equity();
+
+    if(!protectionActivated && totalProfitToday > 0.0)
+    {
+        protectionActivated = true;
+        peakEquity = currentEquity;
+    }
+    
+    if(!protectionActivated) return;
+
+    if(currentEquity > peakEquity)
+        peakEquity = currentEquity;
+    
+    double profitMade = peakEquity - deposit;
+    if(profitMade < 0) profitMade = 0;
+    
+    double lockLevel = deposit + profitMade * (InpEquityLockPercent / 100.0);
+
+    if(currentEquity < lockLevel)
+    {
+        tradingSuspended = true;
+        CloseAllPositions();
+        Print("Equity lock triggered! Trading suspended.");
+    }
+}
+
+//+------------------------------------------------------------------+
+//| OnTradeTransaction function                                      |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
+    {
+        if(HistoryDealSelect(trans.deal))
+        {
+            if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) == InpMagicNumber)
+            {
+                if(HistoryDealGetInteger(trans.deal, DEAL_ENTRY) == DEAL_ENTRY_OUT)
+                {
+                    lastTradeResult = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+                    if(lastTradeResult > 0)
+                    {
+                        winCount++;
+                        consecutiveLosses = 0; // Reset loss streak on a win
+                    }
+                    else
+                    {
+                        lossCount++;
+                        consecutiveLosses++; // Increment loss streak
+                    }
+                }
+            }
+        }
+    }
+}
