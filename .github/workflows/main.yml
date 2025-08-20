@@ -1,0 +1,253 @@
+جي بي تي جديد قوي وتقيل وصفقاته كتير وتحته فى شرح الاينبوت 
+
+
+هو المفروض مظبوط على 8 الي 17 بس انا خليتها صفر علشان يبدا علطول 
+
+
+
+#property strict
+#include <Trade\Trade.mqh>
+#include <Indicators\Indicators.mqh>
+
+CTrade trade;
+
+// إعدادات المستخدم
+input double       RiskPercent              = 1.0;         // نسبة المخاطرة لكل صفقة
+input double       CapitalPreservationRate  = 0.8;         // الاحتفاظ 80% من أعلى حقوق ملكية
+input ENUM_TIMEFRAMES TF                  = PERIOD_M15;  // فريم العمل
+input int          FastMAPeriod            = 5;
+input int          SlowMAPeriod            = 20;
+input int          ATRPeriod               = 14;          // فترة ATR
+input double       ATRMultiplierSL         = 1.5;         // ضرب ATR لحساب وقف الخسارة
+input double       ATRMultiplierTP         = 3.0;         // ضرب ATR لحساب جني الأرباح
+input bool         SessionFilter           = true;        // تفعيل فلتر الجلسة
+input int          SessionStartHour        = 8;           // بداية الجلسة (ساعة محلية)
+input int          SessionEndHour          = 17;          // نهاية الجلسة
+input bool         NewsFilter              = false;       // تعطيل فلتر الأخبار (غير مدعوم)
+input int          MaxTrades               = 5;           // أقصى عدد صفقات مفتوحة
+
+// متغيرات ديناميكية
+double HighEquity = 0.0;
+double EquityThreshold = 0.0;
+datetime LastDailyUpdate = 0;
+int fastHandle = INVALID_HANDLE;
+int slowHandle = INVALID_HANDLE;
+int atrHandle  = INVALID_HANDLE;
+
+// **** وظائف مساعدة ****
+bool IsWithinSession()
+{
+  if(!SessionFilter) return true;
+  datetime now = TimeCurrent();
+  MqlDateTime tm;  TimeToStruct(now, tm);
+  int hour = tm.hour;
+  return(hour >= SessionStartHour && hour < SessionEndHour);
+}
+
+// تم تعطيل فلتر الأخبار لعدم توفر دالة API
+bool IsNewsTime()
+{
+  return false;
+}
+
+void UpdateCapitalThreshold()
+{
+  double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+  if(equity > HighEquity) HighEquity = equity;
+  EquityThreshold = HighEquity * CapitalPreservationRate;
+}
+
+// حساب حجم اللوت
+double CalculateLotSize(double slPoints)
+{
+  double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+  double risk      = balance * RiskPercent / 100.0;
+  double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+  double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+  double slValue   = slPoints * tickValue / tickSize;
+  double baseLot   = risk / slValue;
+  double step      = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+  int digits       = (int)MathRound(-MathLog10(step));
+  double lot       = NormalizeDouble(baseLot, digits);
+  return MathMax(SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), MathMin(lot, SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX)));
+}
+
+// إدارة الصفقات المفتوحة
+void ManagePositions()
+{
+  double atrArr[1];
+  if(CopyBuffer(atrHandle, 0, 0, 1, atrArr) != 1) return;
+  double atr = atrArr[0];
+
+  for(int i = 0; i < PositionsTotal(); i++)
+  {
+    ulong ticket = PositionGetTicket(i);
+    if(!PositionSelectByTicket(ticket)) continue;
+    if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+
+    double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+    double sl    = PositionGetDouble(POSITION_SL);
+    double tp    = PositionGetDouble(POSITION_TP);
+    long type    = PositionGetInteger(POSITION_TYPE);
+    double price = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+    // BreakEven عند تحقيق ربح ≥ SL
+    double profitPoints = (type == POSITION_TYPE_BUY) ? (price - entry) / _Point : (entry - price) / _Point;
+    if(profitPoints >= (sl - entry) / _Point)
+    {
+      if(MathAbs(sl - entry) > _Point)
+        trade.PositionModify(ticket, entry, tp);
+    }
+
+    // Trailing Stop بنصف ATR
+    double trail = (atr * ATRMultiplierSL) / 2;
+    if(trail > 0)
+    {
+      double newSL = (type == POSITION_TYPE_BUY) ? price - trail : price + trail;
+      if((type == POSITION_TYPE_BUY && newSL > sl) || (type == POSITION_TYPE_SELL && newSL < sl))
+      {
+        if(MathAbs(newSL - sl) > _Point)
+          trade.PositionModify(ticket, newSL, tp);
+      }
+    }
+  }
+}
+
+// فتح الصفقات بناءً على EMA و ATR
+void TryOpenTrade()
+{
+  if(PositionsTotal() >= MaxTrades) return;
+  if(!IsWithinSession() || IsNewsTime()) return;
+  if(AccountInfoDouble(ACCOUNT_EQUITY) < EquityThreshold) return;
+
+  double fastArr[1], slowArr[1], atrArr[1];
+  if(CopyBuffer(fastHandle, 0, 0, 1, fastArr) != 1 || CopyBuffer(slowHandle, 0, 0, 1, slowArr) != 1 || CopyBuffer(atrHandle, 0, 0, 1, atrArr) != 1)
+    return;
+
+  double fast = fastArr[0], slow = slowArr[0], atr = atrArr[0];
+  double sl   = ATRMultiplierSL * atr;
+  double tp   = ATRMultiplierTP * atr;
+  double lot  = CalculateLotSize(sl);
+
+  if(fast > slow)
+    trade.Buy(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_ASK), SymbolInfoDouble(_Symbol, SYMBOL_ASK) - sl, SymbolInfoDouble(_Symbol, SYMBOL_ASK) + tp);
+  else if(fast < slow)
+    trade.Sell(lot, _Symbol, SymbolInfoDouble(_Symbol, SYMBOL_BID), SymbolInfoDouble(_Symbol, SYMBOL_BID) + sl, SymbolInfoDouble(_Symbol, SYMBOL_BID) - tp);
+}
+
+// التهيئة
+int OnInit()
+{
+  fastHandle = iMA(_Symbol, TF, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+  slowHandle = iMA(_Symbol, TF, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE);
+  atrHandle  = iATR(_Symbol, TF, ATRPeriod);
+  if(fastHandle == INVALID_HANDLE || slowHandle == INVALID_HANDLE || atrHandle == INVALID_HANDLE)
+    return INIT_FAILED;
+
+  HighEquity     = AccountInfoDouble(ACCOUNT_EQUITY);
+  EquityThreshold = HighEquity * CapitalPreservationRate;
+  LastDailyUpdate = TimeCurrent();
+  EventSetTimer(60);
+  Print("✅ Mina FinancialSmart M15 Ultimate - تم تصحيح الأخطاء وجاهز للتداول");
+  return INIT_SUCCEEDED;
+}
+
+// التنظيف عند الإيقاف
+void OnDeinit(const int reason)
+{
+  if(fastHandle != INVALID_HANDLE) IndicatorRelease(fastHandle);
+  if(slowHandle != INVALID_HANDLE) IndicatorRelease(slowHandle);
+  if(atrHandle  != INVALID_HANDLE) IndicatorRelease(atrHandle);
+  EventKillTimer();
+}
+
+// تايمر للتحديث اليومي
+void OnTimer()
+{
+  if(TimeCurrent() - LastDailyUpdate >= 86400)
+  {
+    UpdateCapitalThreshold();
+    LastDailyUpdate = TimeCurrent();
+  }
+}
+
+// معالج التحديث السريع
+void OnTick()
+{
+  ManagePositions();
+  TryOpenTrade();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+شرح input
+
+المتغير input
+النوع
+الشرح
+BaseRiskPercent
+double
+نسبة المخاطرة الأساسية في كل صفقة من رصيد الحساب (مثلاً 1.0 = 1%).
+CapitalPreservationRate
+double
+نسبة الاحتفاظ من أعلى قيمة لحقوق الملكية (Equity) يتم تحديثها تلقائيًا، لو انخفضت عنها البوت بيوقف فتح صفقات جديدة.
+TF
+ENUM_TIMEFRAMES
+الفريم الزمني الأساسي للتحليل (افتراضي M15).
+FastMAPeriod
+int
+عدد الشموع المستخدمة في المتوسط المتحرك السريع EMA.
+SlowMAPeriod
+int
+عدد الشموع المستخدمة في المتوسط المتحرك البطيء EMA.
+ATRPeriod
+int
+عدد الشموع المستخدمة لحساب مؤشر ATR (Average True Range).
+ATRMultiplierSL
+double
+مضاعف ATR لحساب وقف الخسارة SL.
+ATRMultiplierTP
+double
+مضاعف ATR لحساب جني الأرباح TP.
+RSIPeriod
+int
+عدد الشموع المستخدمة لحساب مؤشر القوة النسبية RSI.
+RSILevelLow
+double
+المستوى السفلي لمؤشر RSI (يُستخدم لتأكيد إشارات الشراء).
+RSILevelHigh
+double
+المستوى العلوي لمؤشر RSI (يُستخدم لتأكيد إشارات البيع).
+MultiTFFilter
+bool
+تفعيل أو تعطيل التأكيد من فريم آخر أصغر (True = مفعل).
+ConfirmTF
+ENUM_TIMEFRAMES
+الفريم الزمني الإضافي الذي يتم استخدامه لتأكيد الاتجاه (افتراضي M5).
+SessionFilter
+bool
+تفعيل التداول فقط خلال جلسة معينة (True = مفعل).
+SessionStartHour
+int
+بداية وقت الجلسة بالتوقيت المحلي (ساعة فقط، مثلاً 8).
+SessionEndHour
+int
+نهاية وقت الجلسة بالتوقيت المحلي (ساعة فقط، مثلاً 17).
+NewsFilter
+bool
+فلتر الأخبار (غير مفعل حالياً، قيمة شكلية False).
+MaxTrades
+int
+أقصى عدد صفقات مسموح بفتحها في نفس الوقت.
+
+
